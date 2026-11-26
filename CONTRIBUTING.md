@@ -76,6 +76,13 @@ internal/store/     Postgres history + embedded migrations
 internal/api/       chi HTTP handlers mirroring the CLI
 ```
 
+**Example: adding a new constructor argument type**
+
+1. Add a case to `Arg.ToScVal` in `internal/config/args.go`
+2. Add the type name to `SupportedArgTypes` in the same file
+3. Add a row to the table test in `internal/config/args_test.go`
+4. No other packages need to change — the new type works through the existing `Arg` plumbing
+
 Three interfaces are the seams the whole design rests on:
 
 | Interface | Production | Test double |
@@ -127,11 +134,99 @@ Implement `store.Store` and run it against `runStoreSuite` in
 `internal/store/store_test.go` — the same suite both existing implementations
 pass. That's what keeps their semantics aligned.
 
+**Example:** start from `internal/store/memory.go`, which implements every
+method with no dependencies. The compile-time assertion catches a missing
+method before the suite runs:
+
+```go
+// internal/store/mystore.go
+package store
+
+// MyStore is a Store backed by <whatever>.
+type MyStore struct{ /* ... */ }
+
+var _ Store = (*MyStore)(nil)
+
+func NewMyStore(dsn string) (*MyStore, error) { /* ... */ }
+```
+
+Then point the shared suite at it. The factory returns a fresh, empty store per
+test, so use a throwaway database or `t.TempDir()`:
+
+```go
+// internal/store/mystore_test.go
+package store_test
+
+import (
+	"testing"
+
+	"github.com/soroworks/soroforge/internal/store"
+	"github.com/stretchr/testify/require"
+)
+
+func TestMyStore(t *testing.T) {
+	runStoreSuite(t, func(t *testing.T) store.Store {
+		s, err := store.NewMyStore(t.TempDir())
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, s.Close()) })
+		return s
+	})
+}
+```
+
+Finally, teach `store.Open` (and `NewMigrator`, if the backend brings its own
+schema) which `DATABASE_URL` belongs to it, and add the backend to the table
+above so the production column stays accurate.
+
 ### Adding a CLI command
 
-Add a `newXxxCmd()` in [`cmd/soroforge/commands.go`](cmd/soroforge/commands.go)
+Add a `newXxxCmd()` in [`cmd/soroforge/root.go`](cmd/soroforge/root.go)
 and register it in `newRootCmd`. If it does anything a CI pipeline would want,
 add the matching HTTP handler too, and have both call the same service method.
+
+**Example:** the shape [`cmd/soroforge/status.go`](cmd/soroforge/status.go)
+uses — one file per command, constructed by a `newXxxCmd()`:
+
+```go
+// cmd/soroforge/drift.go
+package main
+
+import (
+	"github.com/soroworks/soroforge/internal/deploy"
+	"github.com/spf13/cobra"
+)
+
+func newDriftCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "drift <alias>",
+		Short: "Report drift between the ledger and the recorded state",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			a, err := newApp(cmd.Context(), appOptions{})
+			if err != nil {
+				return err
+			}
+			defer a.Close()
+
+			result, err := a.service.Status(cmd.Context(), deploy.StatusRequest{
+				Alias:   args[0],
+				Network: flags.network,
+			})
+			if err != nil {
+				return err
+			}
+			return printStatus(result)
+		},
+	}
+	attachAliasCompletion(cmd)
+	return cmd
+}
+```
+
+Then add `newDriftCmd(),` to the `cmd.AddCommand(...)` list in `newRootCmd`.
+If CI should be able to call it, give it a route in `internal/api/api.go` and a
+handler that calls the same `a.service` method — neither surface owns logic of
+its own.
 
 ### Adding a migration
 
@@ -139,6 +234,18 @@ Add a numbered pair in `internal/store/migrations/`
 (`000002_thing.up.sql` and `000002_thing.down.sql`). They're embedded into the
 binary, so nothing else needs wiring. Write a real `down` — reversibility is
 tested.
+
+**Example: adding a new `status` command**
+
+```bash
+# 1. Create the command file
+touch cmd/soroforge/status.go
+
+# 2. Implement newStatusCmd() in cmd/soroforge/commands.go
+# 3. Register it in newRootCmd()
+# 4. Add the matching HTTP handler in internal/api/handlers.go
+# 5. Both call the same deploy.Service method
+```
 
 ## Deliberately out of scope
 
